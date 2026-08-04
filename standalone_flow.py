@@ -5,15 +5,31 @@ No imports from the parent project, no project database, and no calls to port 55
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 from urllib.request import Request, urlopen
 
-from standalone_core.card_payment import CardPaymentConfig, run_card_payment
+try:
+    from curl_cffi import requests as curl_requests
+except Exception:  # pragma: no cover - optional dependency fallback
+    curl_requests = None
+
+try:
+    import requests as plain_requests
+except Exception:  # pragma: no cover - optional dependency fallback
+    plain_requests = None
+
+from standalone_core.card_payment import (
+    CardPaymentConfig,
+    fetch_stripe_publishable_key,
+    run_card_payment,
+)
 from standalone_core.fingerprint_store import (
     extractor_profile,
     get_account_fingerprint,
@@ -32,6 +48,8 @@ _CONFIG_CACHE: dict[str, Any] = {}
 _CONFIG_CACHE_MTIME_NS = -1
 _PREFLIGHT_LOCK = threading.RLock()
 _PREFLIGHT_CACHE: dict[str, tuple[float, str, dict[str, Any]]] = {}
+_ACCOUNT_CONTEXT_LOCK = threading.RLock()
+_ACCOUNT_CONTEXT_CACHE: dict[str, tuple[float, str, str]] = {}
 
 
 def _text(value: Any) -> str:
@@ -103,6 +121,13 @@ def _account_context(token: str) -> tuple[str, str]:
         account_id = _text(auth.get("chatgpt_account_id") or auth.get("account_id"))
     account_id = account_id or _text(claims.get("chatgpt_account_id") or claims.get("account_id"))
     email = _text(profile.get("email") if isinstance(profile, dict) else "") or _text(claims.get("email"))
+    cache_key = hashlib.sha256(_text(token).encode("utf-8")).hexdigest()
+    if not account_id:
+        with _ACCOUNT_CONTEXT_LOCK:
+            cached = _ACCOUNT_CONTEXT_CACHE.get(cache_key)
+            if cached and cached[0] > time.monotonic():
+                account_id = cached[1]
+                email = email or cached[2]
     if not account_id:
         raise ValueError("AT does not contain an account id")
     return account_id, email
@@ -153,6 +178,133 @@ def _is_proxy_transport_error(value: Any) -> bool:
     )
 
 
+def _select_account_id(payload: Any) -> str:
+    """Select the active account id from the account-check response."""
+    if not isinstance(payload, dict):
+        return ""
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, dict):
+        return ""
+    ordering = payload.get("account_ordering")
+    ordered_keys = [str(item) for item in ordering] if isinstance(ordering, list) else []
+    ordered_keys.extend(str(key) for key in accounts if str(key) not in ordered_keys)
+    fallback = ""
+    for key in ordered_keys:
+        item = accounts.get(key)
+        if not isinstance(item, dict):
+            continue
+        account = item.get("account")
+        nested_id = _text(account.get("account_id")) if isinstance(account, dict) else ""
+        candidate = nested_id or ("" if key == "default" else key)
+        if not candidate:
+            continue
+        if item.get("can_access_with_session") is not False:
+            return candidate
+        fallback = fallback or candidate
+    return fallback
+
+
+def resolve_account(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a ChatGPT account id from an AT via the account-check endpoint."""
+    token = _text(payload.get("access_token"))
+    if not token:
+        raise ValueError("missing AT")
+    claims = _decode_claims(token)
+    auth = claims.get("https://api.openai.com/auth") or {}
+    profile = claims.get("https://api.openai.com/profile") or {}
+    email = _text(profile.get("email") if isinstance(profile, dict) else "") or _text(claims.get("email"))
+    user_id = _text(auth.get("user_id") if isinstance(auth, dict) else "") or _text(claims.get("user_id") or claims.get("sub"))
+    try:
+        account_id, known_email = _account_context(token)
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "email": known_email or email,
+            "user_id": user_id,
+            "source": "jwt_or_cache",
+        }
+    except ValueError as exc:
+        if "account id" not in str(exc).lower():
+            raise
+
+    if curl_requests is None and plain_requests is None:
+        raise RuntimeError("missing HTTP dependency: install curl_cffi")
+    proxy_pool = _pool(payload.get("bind_proxy_pool") or payload.get("proxy_pool"))
+    candidates = proxy_pool or [""]
+    endpoint = (
+        "https://chatgpt.com/backend-api/accounts/check/"
+        "v4-2023-04-27?timezone_offset_min=-480"
+    )
+    device_seed = user_id or email or hashlib.sha256(token.encode("utf-8")).hexdigest()
+    device_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"direct-bind:{device_seed}"))
+    last_error: Exception | None = None
+    for proxy in candidates:
+        session = (
+            curl_requests.Session(impersonate="chrome142")
+            if curl_requests is not None
+            else plain_requests.Session()
+        )
+        try:
+            if hasattr(session, "trust_env"):
+                session.trust_env = False
+            session.headers.update({
+                "Authorization": f"Bearer {token}",
+                "Accept": "*/*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/142.0.0.0 Safari/537.36"
+                ),
+                "Origin": "https://chatgpt.com",
+                "Referer": "https://chatgpt.com/",
+                "oai-device-id": device_id,
+                "oai-language": "zh-CN",
+                "sec-ch-ua": (
+                    '"Not_A Brand";v="99", "Chromium";v="142", '
+                    '"Google Chrome";v="142"'
+                ),
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            })
+            if proxy:
+                session.proxies = {"http": proxy, "https": proxy}
+            response = session.get(endpoint, timeout=30)
+            if response.status_code == 401:
+                raise ValueError("AT invalidated (HTTP 401)")
+            if response.status_code != 200:
+                raise RuntimeError(f"account lookup: HTTP {response.status_code}")
+            account_id = _select_account_id(response.json())
+            if not account_id:
+                raise RuntimeError("account lookup returned no account id")
+            cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            with _ACCOUNT_CONTEXT_LOCK:
+                _ACCOUNT_CONTEXT_CACHE[cache_key] = (
+                    time.monotonic() + 3600,
+                    account_id,
+                    email,
+                )
+            return {
+                "ok": True,
+                "account_id": account_id,
+                "email": email,
+                "user_id": user_id,
+                "source": "account_check",
+            }
+        except ValueError:
+            raise
+        except Exception as exc:  # try the next supplied proxy candidate
+            last_error = exc
+            if not proxy or not _is_proxy_transport_error(exc):
+                raise
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+    raise RuntimeError(f"account lookup failed: {last_error or 'unknown error'}")
+
+
 def _billing_payload(value: Any, *, required: bool) -> dict[str, str]:
     source = value if isinstance(value, dict) else {}
     fields = {
@@ -194,7 +346,9 @@ def validate_payload(payload: dict[str, Any], *, require_payment_method: bool = 
     token = _text(payload.get("access_token"))
     if not token:
         raise ValueError("missing AT")
-    account_id, email = _account_context(token)
+    identity = resolve_account(payload)
+    account_id = _text(identity.get("account_id"))
+    email = _text(identity.get("email"))
     bind_pool = _pool(payload.get("bind_proxy_pool"))
     promo_pool = _pool(payload.get("promo_proxy_pool"))
     mode = _text(payload.get("flow_mode") or "full").lower()
@@ -209,6 +363,13 @@ def validate_payload(payload: dict[str, Any], *, require_payment_method: bool = 
     payment_method_id = _text(payload.get("payment_method_id"))
     if needs_payment_method and not re.fullmatch(r"pm_[A-Za-z0-9_-]+", payment_method_id):
         raise ValueError("missing or invalid PaymentMethod")
+    payment_method_publishable_key = _text(
+        payload.get("payment_method_publishable_key")
+    )
+    if payment_method_publishable_key and not payment_method_publishable_key.startswith(
+        ("pk_live_", "pk_test_")
+    ):
+        raise ValueError("invalid PaymentMethod publishable key")
     return {
         "access_token": token,
         "account_id": account_id,
@@ -217,10 +378,21 @@ def validate_payload(payload: dict[str, Any], *, require_payment_method: bool = 
         "promo_pool": promo_pool,
         "flow_mode": mode,
         "payment_method_id": payment_method_id,
+        "payment_method_publishable_key": payment_method_publishable_key,
         "card_last4": re.sub(r"\D", "", _text(payload.get("card_last4")))[-4:],
         "billing": _billing_payload(
             payload.get("billing"), required=needs_payment_method
         ),
+        # The current checkout bundle obtains these values from SentinelSDK
+        # immediately before /payments/checkout/confirm.  Keep them attached to
+        # the account task so an upstream page/session collector can provide
+        # the matching flow-bound pair without putting it in global config.
+        "sentinel_token": _text(payload.get("sentinel_token")),
+        "telemetry": _text(payload.get("telemetry")),
+        # Checkout creation uses `chatgpt_checkout`; payment confirmation uses
+        # `checkout_session_approval`.  These tokens are flow-bound.
+        "checkout_sentinel_token": _text(payload.get("checkout_sentinel_token")),
+        "checkout_telemetry": _text(payload.get("checkout_telemetry")),
     }
 
 
@@ -277,7 +449,9 @@ def allocate_fingerprint(payload: dict[str, Any]) -> dict[str, Any]:
     token = _text(payload.get("access_token"))
     if not token:
         raise ValueError("missing AT")
-    account_id, email = _account_context(token)
+    identity = resolve_account(payload)
+    account_id = _text(identity.get("account_id"))
+    email = _text(identity.get("email"))
     config = _load_config()
     region = _text(config.get("fingerprint_region") or "US").upper()
     profile, device_id = get_account_fingerprint(account_id, region=region)
@@ -304,7 +478,9 @@ def allocate_fingerprints(payload: dict[str, Any]) -> dict[str, Any]:
             token = _text(item.get("access_token"))
             if not token:
                 raise ValueError("missing AT")
-            account_id, email = _account_context(token)
+            identity = resolve_account(item)
+            account_id = _text(identity.get("account_id"))
+            email = _text(identity.get("email"))
             prepared.append({"account_id": account_id, "region": region})
             metadata.append((client_id, account_id, email))
         except Exception as exc:  # keep one malformed row from blocking the batch
@@ -377,6 +553,8 @@ def _extract_checkout(ctx: dict[str, Any], config: dict[str, Any], logger: Calla
                     diagnose_coupon=bool(config.get("coupon_diagnostic", False)),
                     fingerprint_profile=dict(ctx.get("fingerprint_profile") or {}),
                     device_id=_text(ctx.get("device_id")),
+                    checkout_sentinel_token=_text(ctx.get("checkout_sentinel_token")),
+                    checkout_telemetry=_text(ctx.get("checkout_telemetry")),
                 ),
                 logger=logger,
             ).run(proxy, proxy)
@@ -398,11 +576,43 @@ def preflight(payload: dict[str, Any], logger: Callable[[str], None] = lambda _m
     config = _load_config()
     _attach_fingerprint(ctx, config, logger)
     result = _extract_checkout(ctx, config, logger)
+    payment_config = CardPaymentConfig(
+        token=ctx["access_token"],
+        account_id=ctx["account_id"],
+        device_id=_text(ctx.get("device_id")),
+        fingerprint_profile=dict(ctx.get("fingerprint_profile") or {}),
+        timeout=max(30, min(1800, int(config.get("timeout") or 900))),
+    )
+    bind_candidates = list(ctx["bind_pool"][:8])
+    stripe_publishable_key = ""
+    last_bind_error: Exception | None = None
+    for index, bind_proxy in enumerate(bind_candidates, start=1):
+        try:
+            stripe_publishable_key = fetch_stripe_publishable_key(
+                payment_config,
+                proxy=bind_proxy,
+                logger=logger,
+            )
+            break
+        except Exception as exc:  # read-only preflight can rotate candidates
+            last_bind_error = exc
+            if index >= len(bind_candidates) or not _is_proxy_transport_error(exc):
+                raise
+            logger(
+                f"预检绑卡代理 {index}/{len(bind_candidates)} 连接失败，"
+                "正在切换下一个候选"
+            )
+    if not stripe_publishable_key:
+        raise RuntimeError(
+            "preflight bind proxy pool exhausted "
+            f"({len(bind_candidates)} candidates): {last_bind_error or 'unknown error'}"
+        )
     _remember_preflight(ctx, result, config)
     fingerprint = dict(ctx.get("fingerprint_profile") or {})
     return {
         "ok": True,
-        "publishable_key": _text(result.get("_publishable_key")),
+        "publishable_key": stripe_publishable_key,
+        "checkout_publishable_key": _text(result.get("_publishable_key")),
         "checkout_id": _text(result.get("checkout_id")),
         "processor_entity": _text(result.get("processor_entity")),
         "country": _text(result.get("country") or config.get("country") or "PH"),
@@ -474,6 +684,9 @@ def run_flow(payload: dict[str, Any], logger: Callable[[str], None] = lambda _me
                     promo_campaign="",
                     billing=billing,
                     payment_method_id=ctx["payment_method_id"],
+                    payment_method_publishable_key=ctx[
+                        "payment_method_publishable_key"
+                    ],
                     card_last4=ctx["card_last4"],
                     flow_mode=ctx["flow_mode"],
                     device_id=_text(ctx.get("device_id")),
@@ -488,15 +701,54 @@ def run_flow(payload: dict[str, Any], logger: Callable[[str], None] = lambda _me
                     bind_currency=_text(config.get("bind_currency") or "USD").upper(),
                     strong_bind_direct=True,
                     stop_after_bind=bind_only,
-                    fast_verify=bool(config.get("fast_verify", True)),
+                    # The success loader participates in checkout reconciliation.
+                    # Keep the complete callback chain enabled unless a fixture
+                    # explicitly opts into the shortened verification path.
+                    fast_verify=bool(config.get("fast_verify", False)),
+                    sentinel_token=_text(ctx.get("sentinel_token")),
+                    telemetry=_text(ctx.get("telemetry")),
                 ),
                 proxy=bind_proxy,
                 logger=logger,
-                refresh_checkout=None if bind_only else refresh_checkout,
+                refresh_checkout=(
+                    refresh_checkout if ctx["flow_mode"] == "full" else None
+                ),
             )
             break
         except Exception as exc:  # noqa: BLE001
             last_bind_error = exc
+            if _text(getattr(exc, "action_required", "")) == "checkout_session_confirmation":
+                pending_checkout_id = _text(getattr(exc, "checkout_id", ""))
+                pending_processor = _text(getattr(exc, "processor_entity", ""))
+                pending_link = _text(getattr(exc, "checkout_link", ""))
+                if not pending_link and pending_processor and pending_checkout_id:
+                    pending_link = (
+                        f"https://chatgpt.com/checkout/{pending_processor}/"
+                        f"{pending_checkout_id}"
+                    )
+                logger("支付确认需要当前 Checkout 会话数据，已保留链接等待继续确认。")
+                return {
+                    "ok": False,
+                    "action_required": "checkout_session_confirmation",
+                    "email": ctx["email"],
+                    "payment_flow": "standalone-http-awaiting-session-confirmation",
+                    "flow_complete": False,
+                    "flow_steps": [
+                        "checkout extraction",
+                        "HTTP card bind / payment-method validation",
+                        "checkout session confirmation required",
+                    ],
+                    "checkout_id": pending_checkout_id,
+                    "processor_entity": pending_processor,
+                    "checkout_link": pending_link,
+                    "card_last4": ctx["card_last4"],
+                    "fingerprint": _text(ctx.get("fingerprint_summary")),
+                    "detail": str(exc),
+                }
+            proxy_retry_safe = bool(getattr(exc, "proxy_retry_safe", True))
+            if not proxy_retry_safe:
+                logger("关键绑卡/支付步骤已提交，为避免重复扣款，不切换代理重跑。")
+                raise
             if index >= len(bind_candidates) or not _is_proxy_transport_error(exc):
                 raise
             logger(f"绑卡/支付代理连接失败，自动切换下一个候选：{exc}")

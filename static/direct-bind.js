@@ -60,15 +60,19 @@
 
   function extractTokens(text) {
     const source = String(text || '');
+    const isImportable = (token) => {
+      const decoded = decodeAccount(token);
+      return Boolean(decoded.accountId || decoded.userId || decoded.email);
+    };
     const namedAccessTokens = [...source.matchAll(
       /["']access_token["']\s*:\s*["'](eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)["']/gi,
     )].map((match) => match[1]);
-    if (namedAccessTokens.length) return [...new Set(namedAccessTokens.filter((token) => decodeAccount(token).accountId))];
+    if (namedAccessTokens.length) return [...new Set(namedAccessTokens.filter(isImportable))];
     const jwtMatches = source.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g);
     const candidates = jwtMatches?.length
       ? [...new Set(jwtMatches)]
       : splitValues(source).map((item) => item.replace(/^["']|["']$/g, '')).filter(Boolean);
-    return candidates.filter((token) => Boolean(decodeAccount(token).accountId));
+    return candidates.filter(isImportable);
   }
 
   function decodeAccount(token) {
@@ -82,6 +86,7 @@
       return {
         email: String(profile.email || claims.email || ''),
         accountId: String(auth.chatgpt_account_id || auth.account_id || claims.chatgpt_account_id || claims.account_id || ''),
+        userId: String(auth.user_id || claims.user_id || claims.sub || ''),
       };
     } catch (_) {
       return {};
@@ -113,6 +118,30 @@
     }
   }
 
+  function canonicalCheckoutLink(value = {}, fallback = '') {
+    const direct = String(value.checkout_link || value.checkoutLink || value.link || fallback || '').trim();
+    if (/^https:\/\/chatgpt\.com\/checkout\/[A-Za-z0-9_-]+\/oaics_[A-Za-z0-9_-]+$/.test(direct)) {
+      return direct;
+    }
+    const checkoutId = String(value.checkout_id || value.checkoutId || '').trim();
+    const processor = String(value.processor_entity || value.processorEntity || '').trim();
+    if (/^oaics_[A-Za-z0-9_-]+$/.test(checkoutId) && /^[A-Za-z0-9_-]+$/.test(processor)) {
+      return `https://chatgpt.com/checkout/${processor}/${checkoutId}`;
+    }
+    return '';
+  }
+
+  function restoredAccountStage(item = {}) {
+    const stage = String(item.stage || '待执行')
+      .replace(/^注册指纹已就绪$/, '环境已就绪');
+    if (/^(待会话确认：复制 Checkout 链接后在该账号当前会话继续|订阅尚未提交：当前任务缺少该 Checkout 的会话数据)$/.test(stage)) {
+      return canonicalCheckoutLink(item, item.link)
+        ? '订阅待确认：使用当前行的 Checkout 链接继续'
+        : '订阅待确认：旧任务未保存 Checkout 链接，请重新执行“提链 + 支付”';
+    }
+    return stage;
+  }
+
   function csvCell(value) {
     return `"${String(value ?? '').replace(/"/g, '""')}"`;
   }
@@ -126,7 +155,7 @@
         account.accountId || '',
         accountStatusLabel(account),
         account.stage || '',
-        account.link || '',
+        canonicalCheckoutLink(account, account.link),
         account.error || '',
       ]),
     ];
@@ -168,11 +197,29 @@
     if (lower.includes('missing or invalid paymentmethod') || lower.includes('paymentmethod 创建失败')) {
       return '卡片支付方式创建失败，请重新填写卡片。';
     }
+    if (lower.includes('preflight bind proxy pool exhausted')) {
+      return '预检失败：绑卡/支付代理池候选均连接失败，请检查节点状态、协议和有效期。';
+    }
+    if (lower.includes('提链代理池已耗尽')) {
+      return '预检失败：提链代理池候选均连接失败，请检查节点状态、协议和有效期。';
+    }
     if (lower.includes('proxy') && (lower.includes('connect') || lower.includes('failed') || lower.includes('error'))) {
       return '代理连接失败，请检查代理格式、节点状态和网络。';
     }
     if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('任务超时')) {
       return '请求超时，请检查代理速度后重试。';
+    }
+    if (lower.includes('checkout confirm precondition')) {
+      return '订阅尚未提交：缺少当前 Checkout 会话生成的动态校验数据。';
+    }
+    if (lower.includes('checkout confirm') && lower.includes('server returned blocked')) {
+      return '订阅请求已提交，账号风控返回 status=blocked；订阅未生效，未进入 Stripe Intent，自动重试已关闭。';
+    }
+    if (lower.includes('checkout confirm') && lower.includes('http 403')) {
+      return '提交支付确认被拒绝（HTTP 403）：当前 Checkout 的会话校验数据无效或缺失。';
+    }
+    if (lower.includes('confirmation token') && lower.includes('http 403')) {
+      return 'Stripe Confirmation Token 请求被拒绝（HTTP 403），请检查支付方式与商户公钥是否匹配。';
     }
     if (lower.includes('http 403')) return '请求被拒绝（HTTP 403），请检查账号状态和接口权限。';
     if (lower.includes('http 402')) return '支付请求被拒绝（HTTP 402），请检查卡片状态。';
@@ -305,13 +352,15 @@
     node.textContent = '';
   }
 
-  function showBatchSummary(label, success, failed, stopped = false) {
+  function showBatchSummary(label, success, failed, stopped = false, pending = 0) {
     const node = $('batchSummary');
     node.hidden = false;
-    node.className = `batch-summary ${stopped ? 'is-stopped' : failed ? '' : 'is-success'}`;
+    node.className = `batch-summary ${stopped || pending ? 'is-stopped' : failed ? '' : 'is-success'}`;
     node.textContent = stopped
       ? `${label}已停止：${success} 个成功，${failed} 个失败或未执行。`
-      : `${label}完成：${success} 个成功，${failed} 个失败。`;
+      : pending
+        ? `${label}已完成 HTTP 阶段：${success} 个成功，${pending} 个尚未提交，${failed} 个失败。`
+        : `${label}完成：${success} 个成功，${failed} 个失败。`;
   }
 
   function saveProxyDraft() {
@@ -346,11 +395,15 @@
           token: account.token,
           email: account.email || '',
           accountId: account.accountId || '',
+          userId: account.userId || '',
           selected: Boolean(account.selected),
           status: account.status || 'idle',
           stage: account.stage || '待执行',
           error: account.error || '',
-          link: account.link || '',
+          link: canonicalCheckoutLink(account, account.link),
+          checkoutId: account.checkoutId || '',
+          processorEntity: account.processorEntity || '',
+          lastTaskId: account.lastTaskId || '',
           taskId: account.taskId || '',
           bindProxyLabel: account.bindProxyLabel || '',
           promoProxyLabel: account.promoProxyLabel || '',
@@ -387,21 +440,23 @@
       state.accounts = items
         .filter((item) => item && typeof item.token === 'string' && item.token.trim())
         .map((item) => ({ item, decoded: decodeAccount(item.token.trim()) }))
-        .filter(({ decoded }) => Boolean(decoded.accountId))
+        .filter(({ decoded }) => Boolean(decoded.accountId || decoded.userId || decoded.email))
         .map(({ item, decoded }, index) => ({
           id: String(item.id || `account-${index + 1}`),
           token: item.token.trim(),
           email: String(decoded.email || item.email || ''),
           accountId: String(decoded.accountId || item.accountId || ''),
+          userId: String(decoded.userId || item.userId || ''),
           selected: item.selected !== false,
-          status: ['idle', 'running', 'success', 'error'].includes(item.status) ? item.status : 'idle',
-          stage: isStoredCardDecline(item.error)
-            ? '绑卡失败'
-            : String(item.stage || '待执行').replace(/^注册指纹已就绪$/, '环境已就绪'),
+          status: ['idle', 'running', 'success', 'error', 'action_required'].includes(item.status) ? item.status : 'idle',
+          stage: isStoredCardDecline(item.error) ? '绑卡失败' : restoredAccountStage(item),
           error: isStoredCardDecline(item.error)
             ? CARD_DECLINE_MESSAGE
             : item.error ? translateError(item.error) : '',
-          link: String(item.link || ''),
+          checkoutId: String(item.checkoutId || ''),
+          processorEntity: String(item.processorEntity || ''),
+          link: canonicalCheckoutLink(item, item.link),
+          lastTaskId: String(item.lastTaskId || ''),
           taskId: String(item.taskId || ''),
           bindProxyLabel: String(item.bindProxyLabel || ''),
           promoProxyLabel: String(item.promoProxyLabel || ''),
@@ -524,6 +579,7 @@
   function accountStatusLabel(account) {
     if (account.status === 'success') return '完成';
     if (account.status === 'error') return '失败';
+    if (account.status === 'action_required') return '待提交';
     if (account.status === 'running') return '运行中';
     return '待执行';
   }
@@ -575,14 +631,16 @@
       ].filter(Boolean);
       stage.title = diagnostics.join('\n');
       meta.append(accountName, stage);
-      if (account.link) {
+      const checkoutLink = canonicalCheckoutLink(account, account.link);
+      if (checkoutLink) {
+        account.link = checkoutLink;
         const link = document.createElement('button');
         link.type = 'button';
         link.className = 'task-row__link';
         link.textContent = '复制链接';
-        link.title = account.link;
+        link.title = checkoutLink;
         link.addEventListener('click', async () => {
-          const copied = await copyText(account.link);
+          const copied = await copyText(checkoutLink);
           link.textContent = copied ? '已复制' : '复制失败';
           window.setTimeout(() => {
             if (link.isConnected) link.textContent = '复制链接';
@@ -720,15 +778,76 @@
   async function hydrateMissingFingerprints() {
     // 已落盘且为 US 的兼容指纹直接复用；只修复缺失或旧 TR/chrome144 数据。
     const pending = state.accounts.filter((account) => (
-      !account.fingerprintId
+      account.accountId
+      && (!account.fingerprintId
       || !account.fingerprintTls
       || String(account.fingerprintRegion || '').toUpperCase() !== 'US'
       || String(account.fingerprintTls || '').toLowerCase() === 'chrome144'
-      || /chrome\/144/i.test(String(account.fingerprint || ''))
+      || /chrome\/144/i.test(String(account.fingerprint || '')))
     ));
     if (!pending.length) return;
     await allocateFingerprints(pending, { quiet: true });
     if (pending.length) appendLog(`已同步 ${pending.length} 个账号的注册指纹与 TLS 兼容版本。`);
+  }
+
+  async function resolveAccountIds(accounts, { quiet = false } = {}) {
+    const pending = accounts.filter((account) => !account.accountId);
+    if (!pending.length) return { resolved: 0, failed: 0 };
+    const bind = parseProxyPool($('bindProxyPool').value);
+    let cursor = 0;
+    let resolved = 0;
+    let failed = 0;
+    pending.forEach((account) => {
+      account.status = 'idle';
+      account.stage = '正在通过 AT 获取账号 ID';
+      account.error = '';
+    });
+    scheduleRenderAccounts();
+    async function worker() {
+      while (cursor < pending.length) {
+        const index = cursor++;
+        const account = pending[index];
+        const accountIndex = Math.max(0, state.accounts.indexOf(account));
+        try {
+          const response = await fetch('/api/account/resolve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              access_token: account.token,
+              bind_proxy_pool: bind.length ? [bind[accountIndex % bind.length]] : [],
+            }),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok || payload.ok === false || !payload.account_id) {
+            throw new Error(payload.error || `账号 ID 获取失败：HTTP ${response.status}`);
+          }
+          account.accountId = String(payload.account_id);
+          account.userId = String(payload.user_id || account.userId || '');
+          account.email = String(payload.email || account.email || '');
+          account.status = 'idle';
+          account.stage = '账号 ID 已获取，正在准备环境';
+          account.error = '';
+          resolved += 1;
+        } catch (error) {
+          account.status = 'error';
+          account.stage = '账号 ID 获取失败';
+          account.error = translateError(error?.message || error);
+          failed += 1;
+        }
+        scheduleRenderAccounts();
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(8, pending.length) }, worker));
+    saveAccounts();
+    renderAccounts();
+    refresh();
+    if (!quiet) appendLog(`AT 获取账号 ID：${resolved} 个成功，${failed} 个失败。`);
+    return { resolved, failed };
+  }
+
+  async function hydrateMissingAccountIds() {
+    const pending = state.accounts.filter((account) => !account.accountId);
+    if (pending.length) await resolveAccountIds(pending, { quiet: true });
   }
 
   async function hydrateMissingBillingAddresses() {
@@ -747,16 +866,21 @@
     values.forEach((token) => {
       if (!token || existing.has(token)) return;
       const decoded = decodeAccount(token);
+      const identityMissing = !decoded.accountId;
       state.accounts.push({
         id: `account-${state.nextId++}`,
         token,
         email: decoded.email || '',
         accountId: decoded.accountId || '',
+        userId: decoded.userId || '',
         selected: true,
         status: 'idle',
-        stage: '待执行',
+        stage: identityMissing ? '账号已导入，缺少账号 ID' : '待执行',
         error: '',
         link: '',
+        checkoutId: '',
+        processorEntity: '',
+        lastTaskId: '',
         taskId: '',
         bindProxyLabel: '',
         promoProxyLabel: '',
@@ -777,12 +901,23 @@
     updateImportCount();
     renderAccounts();
     refresh();
+    const importStatus = $('accountImportStatus');
+    if (importStatus) {
+      importStatus.className = `proxy-pool-note ${added ? '' : 'is-error'}`.trim();
+      importStatus.textContent = added
+        ? `已导入 ${added} 个账号，正在通过 AT 获取账号 ID。`
+        : '没有发现新的账号，或文件中的账号已经导入。';
+    }
     log(added ? `已导入 ${added} 个账号，导入框已清空。` : '没有发现新的账号。');
     if (imported.length) {
-      await Promise.all([
-        allocateFingerprints(imported),
-        assignBillingAddresses(imported),
-      ]);
+      const billingPromise = assignBillingAddresses(imported);
+      const identityResult = await resolveAccountIds(imported, { quiet: true });
+      const resolvedAccounts = imported.filter((account) => account.accountId);
+      await Promise.all([allocateFingerprints(resolvedAccounts), billingPromise]);
+      if (importStatus) {
+        importStatus.className = `proxy-pool-note ${identityResult.failed ? 'is-error' : ''}`.trim();
+        importStatus.textContent = `已导入 ${added} 个账号；AT 获取账号 ID 成功 ${identityResult.resolved + (added - identityResult.resolved - identityResult.failed)} 个，失败 ${identityResult.failed} 个。`;
+      }
     }
   }
 
@@ -800,13 +935,15 @@
     const bind = parseProxyPool($('bindProxyPool').value);
     const promo = parseProxyPool($('promoProxyPool').value);
     const selected = selectedAccounts();
+    const missingAccountIds = selected.filter((account) => !account.accountId);
     const billingMissingAccounts = state.publishableKey
       ? selected.filter((account) => billingIssues(normalizedBilling(account.billing || {}, account.email)).length > 0)
       : [];
     $('bindProxyCount').textContent = `${bind.length} PROXY`;
     $('promoProxyCount').textContent = `${promo.length} PROXY`;
-    const basicReady = Boolean(selected.length && bind.length && promo.length);
-    const linkOnlyReady = Boolean(selected.length && promo.length);
+    const identityReady = Boolean(selected.length && missingAccountIds.length === 0);
+    const basicReady = Boolean(identityReady && bind.length && promo.length);
+    const linkOnlyReady = Boolean(identityReady && promo.length);
     const cardInputReady = state.mounted && Object.values(state.complete).every(Boolean);
     const billingReady = !state.publishableKey || billingMissingAccounts.length === 0;
     const ready = basicReady && cardInputReady && billingReady;
@@ -821,9 +958,10 @@
     $('selectAllAccounts').disabled = state.running || !state.accounts.length;
     $('cardReady').className = `inline-state ${ready ? 'ok' : ''}`;
     if (ready) $('cardReady').textContent = `卡片输入已就绪；已选择 ${selected.length} 个账号。`;
+    else if (missingAccountIds.length) $('cardReady').textContent = `${missingAccountIds.length} 个 AT 缺少账号 ID，请导入 ChatGPT access_token。`;
     else if (!basicReady) $('cardReady').textContent = '请先导入并选择账号，填写双代理池后再加载卡片。';
     else if (!billingReady) $('cardReady').textContent = `还有 ${billingMissingAccounts.length} 个账号的账单地址未就绪。`;
-    return { accounts: selected, bind, promo, basicReady, linkOnlyReady, cardInputReady, billingReady, billingMissingAccounts, ready };
+    return { accounts: selected, bind, promo, basicReady, linkOnlyReady, cardInputReady, billingReady, billingMissingAccounts, missingAccountIds, ready };
   }
 
   async function mountCard() {
@@ -835,33 +973,64 @@
       const missingBilling = state.accounts.filter((account) => (
         billingIssues(normalizedBilling(account.billing || {}, account.email)).length > 0
       ));
-      const previewBind = data.bind[state.bindProxyCursor % data.bind.length];
-      const previewPromo = data.promo[state.promoProxyCursor % data.promo.length];
-      const checkoutPromise = fetch('/api/card-bind/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          access_token: data.accounts[0].token,
-          bind_proxy_pool: [previewBind],
-          promo_proxy_pool: [previewPromo],
-        }),
-      });
-      const [, , response] = await Promise.all([
+      const preflightPayloads = new Array(data.accounts.length);
+      let preflightCursor = 0;
+      const preflightLimit = Math.max(
+        1,
+        Math.min(
+          MAX_BATCH_CONCURRENCY,
+          Number($('batchConcurrency').value) || 1,
+          data.accounts.length,
+        ),
+      );
+      async function preflightWorker() {
+        while (preflightCursor < data.accounts.length) {
+          const index = preflightCursor++;
+          const account = data.accounts[index];
+          const previewBindPool = data.bind
+            .map((_, offset) => data.bind[(state.bindProxyCursor + index + offset) % data.bind.length])
+            .slice(0, MAX_PROXY_FALLBACKS);
+          const previewPromoPool = data.promo
+            .map((_, offset) => data.promo[(state.promoProxyCursor + index + offset) % data.promo.length])
+            .slice(0, MAX_PROXY_FALLBACKS);
+          const response = await fetch('/api/card-bind/session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              access_token: account.token,
+              bind_proxy_pool: previewBindPool,
+              promo_proxy_pool: previewPromoPool,
+            }),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok || payload.ok === false) {
+            throw new Error(`${account.email || account.id} 预检失败：${payload.error || `HTTP ${response.status}`}`);
+          }
+          preflightPayloads[index] = payload;
+        }
+      }
+      await Promise.all([
         ensureStripeJs(),
         assignBillingAddresses(missingBilling),
-        checkoutPromise,
+        Promise.all(Array.from({ length: preflightLimit }, preflightWorker)),
       ]);
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok || payload.ok === false) throw new Error(payload.error || `预检失败：HTTP ${response.status}`);
-      data.accounts[0].fingerprint = String(payload.fingerprint || data.accounts[0].fingerprint || '');
-      data.accounts[0].fingerprintId = String(payload.fingerprint_id || data.accounts[0].fingerprintId || '');
-      data.accounts[0].fingerprintTls = String(payload.fingerprint_tls || data.accounts[0].fingerprintTls || '');
-      data.accounts[0].fingerprintRegion = String(payload.fingerprint_region || data.accounts[0].fingerprintRegion || '');
-      data.accounts[0].fingerprintTimezone = String(payload.fingerprint_timezone || data.accounts[0].fingerprintTimezone || '');
+      const keys = new Set(preflightPayloads.map((item) => String(item?.publishable_key || '')));
+      if (keys.has('') || keys.size !== 1) {
+        throw new Error(`所选账号分属 ${keys.size} 个 Stripe 商户，当前卡片输入框只能处理同一商户账号`);
+      }
+      preflightPayloads.forEach((payload, index) => {
+        const account = data.accounts[index];
+        account.fingerprint = String(payload.fingerprint || account.fingerprint || '');
+        account.fingerprintId = String(payload.fingerprint_id || account.fingerprintId || '');
+        account.fingerprintTls = String(payload.fingerprint_tls || account.fingerprintTls || '');
+        account.fingerprintRegion = String(payload.fingerprint_region || account.fingerprintRegion || '');
+        account.fingerprintTimezone = String(payload.fingerprint_timezone || account.fingerprintTimezone || '');
+      });
       saveAccounts();
       renderAccounts();
+      const payload = preflightPayloads[0];
       const key = String(payload.publishable_key || '');
-      if (!key.startsWith('pk_')) throw new Error('Checkout 没有返回有效的 Stripe 公钥');
+      if (!key.startsWith('pk_')) throw new Error('账号 Stripe 初始化没有返回有效公钥');
       state.publishableKey = key;
       state.stripe = window.Stripe(key);
       const elements = state.stripe.elements();
@@ -903,6 +1072,7 @@
     const result = await state.stripe.createPaymentMethod({
       type: 'card',
       card: state.elements.number,
+      allow_redisplay: 'always',
       billing_details: {
         name: billing.name,
         email: billing.email || undefined,
@@ -919,7 +1089,12 @@
     if (result.error) throw new Error(result.error.message || 'PaymentMethod 创建失败');
     const paymentMethod = result.paymentMethod || {};
     if (!paymentMethod.id) throw new Error('PaymentMethod 创建失败');
-    return { id: paymentMethod.id, last4: paymentMethod.card?.last4 || '', billing };
+    return {
+      id: paymentMethod.id,
+      last4: paymentMethod.card?.last4 || '',
+      billing,
+      publishableKey: state.publishableKey,
+    };
   }
 
   async function prepareAccountCard(account) {
@@ -940,6 +1115,7 @@
     };
     if (mode !== 'link_only') Object.assign(payload, {
       payment_method_id: browserCard.id,
+      payment_method_publishable_key: browserCard.publishableKey,
       card_last4: browserCard.last4,
       billing: browserCard.billing,
       bind_proxy_pool: account.bindProxyPool?.length ? account.bindProxyPool : [account.bindProxy],
@@ -958,12 +1134,35 @@
       const result = task.result || {};
       if (Array.isArray(task.steps)) account.steps = task.steps;
       if (task.status === 'done') {
+        const checkoutLink = canonicalCheckoutLink(result);
         updateAccount(account, {
           email: result.email || account.email,
           status: 'success',
           stage: task.stage || '任务完成',
-          link: result.checkout_link || '',
+          checkoutId: String(result.checkout_id || ''),
+          processorEntity: String(result.processor_entity || ''),
+          link: checkoutLink,
+          lastTaskId: taskId,
           error: '',
+          taskId: '',
+          fingerprint: result.fingerprint || account.fingerprint || '',
+          steps: Array.isArray(task.steps) ? task.steps : account.steps,
+        });
+        return result;
+      }
+      if (task.status === 'action_required') {
+        const checkoutLink = canonicalCheckoutLink(result, account.link);
+        updateAccount(account, {
+          email: result.email || account.email,
+          status: 'action_required',
+          stage: task.stage || (checkoutLink
+            ? '订阅待确认：使用当前行的 Checkout 链接继续'
+            : '订阅待确认：Checkout 链接生成失败'),
+          checkoutId: String(result.checkout_id || account.checkoutId || ''),
+          processorEntity: String(result.processor_entity || account.processorEntity || ''),
+          link: checkoutLink,
+          error: '',
+          lastTaskId: taskId,
           taskId: '',
           fingerprint: result.fingerprint || account.fingerprint || '',
           steps: Array.isArray(task.steps) ? task.steps : account.steps,
@@ -1055,6 +1254,7 @@
     updateProgress(0, accounts.length, `${label}同步并发`);
     let done = 0;
     let success = 0;
+    let pending = 0;
 
     function recordFailure(account, error) {
       const message = translateError(error?.message || error);
@@ -1097,7 +1297,10 @@
         const settled = await submitAlignedWave(prepared, mode);
         settled.forEach((result, index) => {
           const account = prepared[index].account;
-          if (result.status === 'fulfilled') success += 1;
+          if (result.status === 'fulfilled') {
+            if (account.status === 'action_required') pending += 1;
+            else success += 1;
+          }
           else recordFailure(account, result.reason);
           done += 1;
           updateProgress(done, accounts.length, label);
@@ -1123,8 +1326,9 @@
     showBatchSummary(
       mode === 'bind_only' ? '批量绑卡' : mode === 'link_only' ? '批量提链' : '批量支付',
       success,
-      Math.max(0, accounts.length - success),
+      Math.max(0, accounts.length - success - pending),
       state.stop,
+      pending,
     );
     renderAccounts();
     refresh();
@@ -1197,5 +1401,8 @@
   renderAccounts();
   refresh();
   log(state.accounts.length ? `已恢复 ${state.accounts.length} 个账号及其状态。` : '先在上方导入账号，再填写代理与卡片。');
-  void Promise.all([hydrateMissingFingerprints(), hydrateMissingBillingAddresses()]);
+  void (async () => {
+    await hydrateMissingAccountIds();
+    await Promise.all([hydrateMissingFingerprints(), hydrateMissingBillingAddresses()]);
+  })();
 }());

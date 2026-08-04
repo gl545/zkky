@@ -56,6 +56,7 @@ CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
 CHECKOUT_UPDATE_URL = "https://chatgpt.com/backend-api/payments/checkout/update"
 CHECKOUT_TAXES_URL = "https://chatgpt.com/backend-api/payments/checkout/taxes"
 COUPON_CHECK_URL = "https://chatgpt.com/backend-api/promo_campaign/check_coupon"
+APP_BASE = "https://chatgpt.com"
 DEFAULT_TIMEOUT = 45
 
 FINGERPRINT_PROFILES = [
@@ -605,6 +606,12 @@ class Mode8Config:
     diagnose_coupon: bool = True
     fingerprint_profile: dict[str, str] | None = None
     device_id: str = ""
+    client_build_number: str = ""
+    client_version: str = ""
+    oai_session_id: str = ""
+    web_deployment_attestation: str = ""
+    checkout_sentinel_token: str = ""
+    checkout_telemetry: str = ""
 
 
 class Mode8Extractor:
@@ -627,8 +634,89 @@ class Mode8Extractor:
             self.config.fingerprint_profile,
             self.config.device_id,
         )
+        self._hydrate_payment_metadata(session)
         self.log(f"纯 HTTP 指纹档案：{fingerprint}")
         return session
+
+    def _hydrate_payment_metadata(self, session: Any) -> dict[str, str]:
+        cfg = self.config
+        metadata = {
+            "client_build_number": str(cfg.client_build_number or "").strip(),
+            "client_version": str(cfg.client_version or "").strip(),
+            "session_id": str(cfg.oai_session_id or "").strip(),
+            "attestation": str(cfg.web_deployment_attestation or "").strip(),
+        }
+        if not all(metadata.values()):
+            try:
+                response = session.get(
+                    f"{APP_BASE}/",
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Content-Type": None,
+                        "Origin": None,
+                        "Referer": f"{APP_BASE}/",
+                    },
+                    timeout=min(cfg.timeout, 30),
+                )
+                if int(getattr(response, "status_code", 0) or 0) < 400:
+                    html = str(getattr(response, "text", "") or "")
+                    patterns = {
+                        "client_version": r'data-build="([^"]+)"',
+                        "client_build_number": r'data-seq="([^"]+)"',
+                        "attestation": r'"webDeploymentAttestation":"([^"]+)"',
+                        "session_id": r'"sessionId":"([0-9a-fA-F-]{36})"',
+                    }
+                    for key, pattern in patterns.items():
+                        match = re.search(pattern, html)
+                        if match:
+                            metadata[key] = match.group(1)
+            except Exception as exc:
+                self.log(
+                    f"payment bootstrap metadata skipped: {type(exc).__name__}"
+                )
+
+        metadata["session_id"] = metadata["session_id"] or str(uuid.uuid4())
+        session.headers.update(
+            {
+                key: value
+                for key, value in {
+                    "OAI-Client-Build-Number": metadata["client_build_number"],
+                    "OAI-Client-Version": metadata["client_version"],
+                    "OAI-Session-Id": metadata["session_id"],
+                }.items()
+                if value
+            }
+        )
+        try:
+            setattr(session, "_oai_payment_attestation", metadata["attestation"])
+        except Exception:
+            pass
+        cfg.client_build_number = metadata["client_build_number"]
+        cfg.client_version = metadata["client_version"]
+        cfg.oai_session_id = metadata["session_id"]
+        cfg.web_deployment_attestation = metadata["attestation"]
+        return metadata
+
+    def _payment_headers(
+        self,
+        session: Any,
+        headers: dict[str, Any],
+        *,
+        include_checkout_sentinel: bool = False,
+    ) -> dict[str, Any]:
+        output = dict(headers)
+        attestation = str(
+            getattr(session, "_oai_payment_attestation", "") or ""
+        ).strip()
+        if attestation:
+            output["OAI-Web-Deployment-Attestation"] = attestation
+        if include_checkout_sentinel:
+            token = str(self.config.checkout_sentinel_token or "").strip()
+            telemetry = str(self.config.checkout_telemetry or "").strip()
+            if token:
+                output["OpenAI-Sentinel-Token"] = token
+                output["OAI-Telemetry"] = telemetry or "[1,null]"
+        return output
 
     def _coupon_diagnostic(self, session: Any) -> dict[str, Any]:
         campaign = self.config.promo_campaign.strip()
@@ -694,11 +782,15 @@ class Mode8Extractor:
         response = session.post(
             CHECKOUT_URL,
             json=body,
-            headers={
-                "Referer": "https://chatgpt.com/",
-                "x-openai-target-path": "/backend-api/payments/checkout",
-                "x-openai-target-route": "/backend-api/payments/checkout",
-            },
+            headers=self._payment_headers(
+                session,
+                {
+                    "Referer": "https://chatgpt.com/",
+                    "x-openai-target-path": "/backend-api/payments/checkout",
+                    "x-openai-target-route": "/backend-api/payments/checkout",
+                },
+                include_checkout_sentinel=True,
+            ),
             timeout=cfg.timeout,
         )
         if response.status_code >= 400:
@@ -733,14 +825,17 @@ class Mode8Extractor:
         response = session.post(
             CHECKOUT_UPDATE_URL,
             json=body,
-            headers={
-                "Origin": "https://chatgpt.com",
-                "Referer": (
-                    f"https://chatgpt.com/checkout/{processor_entity}/{checkout_id}"
-                ),
-                "x-openai-target-path": "/backend-api/payments/checkout/update",
-                "x-openai-target-route": "/backend-api/payments/checkout/update",
-            },
+            headers=self._payment_headers(
+                session,
+                {
+                    "Origin": "https://chatgpt.com",
+                    "Referer": (
+                        f"https://chatgpt.com/checkout/{processor_entity}/{checkout_id}"
+                    ),
+                    "x-openai-target-path": "/backend-api/payments/checkout/update",
+                    "x-openai-target-route": "/backend-api/payments/checkout/update",
+                },
+            ),
             timeout=cfg.timeout,
         )
         if response.status_code >= 400:
@@ -767,14 +862,17 @@ class Mode8Extractor:
                 "billing_currency": cfg.currency.upper(),
                 "currency": cfg.currency.upper(),
             },
-            headers={
-                "Origin": "https://chatgpt.com",
-                "Referer": (
-                    f"https://chatgpt.com/checkout/{processor_entity}/{checkout_id}"
-                ),
-                "x-openai-target-path": "/backend-api/payments/checkout/taxes",
-                "x-openai-target-route": "/backend-api/payments/checkout/taxes",
-            },
+            headers=self._payment_headers(
+                session,
+                {
+                    "Origin": "https://chatgpt.com",
+                    "Referer": (
+                        f"https://chatgpt.com/checkout/{processor_entity}/{checkout_id}"
+                    ),
+                    "x-openai-target-path": "/backend-api/payments/checkout/taxes",
+                    "x-openai-target-route": "/backend-api/payments/checkout/taxes",
+                },
+            ),
             timeout=cfg.timeout,
         )
         if response.status_code >= 400:

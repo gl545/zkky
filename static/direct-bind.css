@@ -90,7 +90,7 @@ button:disabled { opacity:.42; cursor:not-allowed; }
 .account-row { grid-template-columns:auto minmax(0,1fr) auto; align-items:center; }
 .account-row__summary { display:grid; grid-template-columns:minmax(360px,32%) minmax(300px,1fr) auto; gap:14px; align-items:center; min-width:0; }
 .task-row__account { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.account-row__current-step { min-width:0; margin:0; overflow:hidden; color:#91abc5; text-overflow:ellipsis; white-space:nowrap; }
+.account-row__current-step { min-width:0; margin:0; overflow:visible; color:#91abc5; white-space:normal; overflow-wrap:anywhere; word-break:break-word; line-height:1.45; }
 .account-row__current-step.is-error { color:var(--danger); }
 button.task-row__link { display:inline; margin:0; padding:0; border:0; border-radius:0; background:none; color:var(--accent); font:12px ui-monospace,Consolas,monospace; white-space:nowrap; }
 button.task-row__link:hover { text-decoration:underline; }

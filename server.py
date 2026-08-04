@@ -15,6 +15,7 @@ from standalone_flow import (
     allocate_fingerprints,
     fetch_billing_address,
     preflight,
+    resolve_account,
     run_flow,
     validate_payload,
 )
@@ -62,8 +63,20 @@ def _safe_error(value: Any) -> str:
         return "该条不是可用的 AT（缺少账号 ID），请导入 access_token。"
     if "timeout" in lower or "timed out" in lower:
         return "请求超时，请检查代理速度后重试。"
+    if "preflight bind proxy pool exhausted" in lower:
+        return "预检失败：绑卡/支付代理池候选均连接失败，请检查节点状态、协议和有效期。"
+    if "提链代理池已耗尽" in lower:
+        return "预检失败：提链代理池候选均连接失败，请检查节点状态、协议和有效期。"
     if "proxy" in lower and any(word in lower for word in ("connect", "failed", "error")):
         return "代理连接失败，请检查代理格式、节点状态和网络。"
+    if "checkout confirm precondition" in lower:
+        return "订阅尚未提交：缺少当前 Checkout 会话生成的动态校验数据。"
+    if "checkout confirm" in lower and "server returned blocked" in lower:
+        return "订阅请求已提交，账号风控返回 status=blocked；订阅未生效，未进入 Stripe Intent，自动重试已关闭。"
+    if "checkout confirm" in lower and "http 403" in lower:
+        return "提交支付确认被拒绝（HTTP 403）：当前 Checkout 的会话校验数据无效或缺失。"
+    if "confirmation token" in lower and "http 403" in lower:
+        return "Stripe Confirmation Token 请求被拒绝（HTTP 403），请检查支付方式与商户公钥是否匹配。"
     if "http 403" in lower:
         return "请求被拒绝（HTTP 403），请检查账号状态和接口权限。"
     if "http 402" in lower:
@@ -71,6 +84,21 @@ def _safe_error(value: Any) -> str:
     if "failed to perform, curl" in lower:
         return "网络请求失败，请检查代理和本机网络。"
     return text[:500]
+
+
+def _checkout_link(result: dict[str, Any]) -> str:
+    """Return a canonical Checkout link even when one response field is absent."""
+    direct = str(result.get("checkout_link") or "").strip()
+    if direct.startswith("https://chatgpt.com/checkout/"):
+        return direct
+    checkout_id = str(result.get("checkout_id") or "").strip()
+    processor = str(result.get("processor_entity") or "").strip()
+    if (
+        re.fullmatch(r"oaics_[A-Za-z0-9_-]+", checkout_id)
+        and re.fullmatch(r"[A-Za-z0-9_-]+", processor)
+    ):
+        return f"https://chatgpt.com/checkout/{processor}/{checkout_id}"
+    return ""
 
 
 def _set_task(task_id: str, **values: Any) -> None:
@@ -211,6 +239,36 @@ def _run_task(
     )
     try:
         result = run_flow(payload, logger=log)
+        if result.get("action_required") == "checkout_session_confirmation":
+            checkout_link = _checkout_link(result)
+            pending_result = {
+                **result,
+                "checkout_link": checkout_link,
+                "logs": logs[-40:],
+            }
+            _update_step(
+                task_id,
+                "payment",
+                "pending",
+                (
+                    "等待对应 Checkout 会话确认；链接已保留在当前行"
+                    if checkout_link
+                    else "等待对应 Checkout 会话确认；Checkout 标识缺失"
+                ),
+            )
+            _set_task(
+                task_id,
+                status="action_required",
+                progress=92,
+                stage=(
+                    "订阅待确认：使用当前行的 Checkout 链接继续"
+                    if checkout_link
+                    else "订阅待确认：Checkout 链接生成失败"
+                ),
+                result=pending_result,
+                finished_at=time.time(),
+            )
+            return
         _set_task(
             task_id,
             status="done",
@@ -299,6 +357,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path not in {
             "/api/fingerprint/allocate",
             "/api/fingerprint/allocate-batch",
+            "/api/account/resolve",
             "/api/address",
             "/api/card-bind/session",
             "/api/standalone-flow/quick-checkout",
@@ -318,6 +377,9 @@ class Handler(SimpleHTTPRequestHandler):
                 if not str(result.get("publishable_key") or "").startswith("pk_"):
                     raise RuntimeError("preflight did not return a publishable key")
                 self._send_json(200, result)
+                return
+            if path == "/api/account/resolve":
+                self._send_json(200, resolve_account(payload))
                 return
             if path == "/api/fingerprint/allocate":
                 self._send_json(200, allocate_fingerprint(payload))

@@ -16,6 +16,7 @@ from server import (
     Handler,
     _fail_running_step,
     _initial_steps,
+    _checkout_link,
     _run_task,
     _safe_error,
     _set_task,
@@ -23,6 +24,7 @@ from server import (
 )
 from standalone_flow import (
     _extract_checkout,
+    _select_account_id,
     allocate_fingerprint,
     allocate_fingerprints,
     fetch_billing_address,
@@ -146,28 +148,77 @@ class StandaloneTests(unittest.TestCase):
             "processor_entity": "openai_llc",
         }
         with patch("standalone_flow._extract_checkout", return_value=checkout) as extract:
-            with patch("standalone_flow.run_card_payment", return_value=payment_result):
-                preflight(preflight_payload)
-                run_flow({
-                    **preflight_payload,
-                    "payment_method_id": "pm_fixture",
-                    "card_last4": "4242",
-                    "flow_mode": "bind_only",
-                    "billing": fixture_billing(),
-                })
+            with patch(
+                "standalone_flow.fetch_stripe_publishable_key",
+                return_value="pk_test_fixture",
+            ):
+                with patch("standalone_flow.run_card_payment", return_value=payment_result):
+                    preflight(preflight_payload)
+                    run_flow({
+                        **preflight_payload,
+                        "payment_method_id": "pm_fixture",
+                        "payment_method_publishable_key": "pk_test_fixture",
+                        "card_last4": "4242",
+                        "flow_mode": "bind_only",
+                        "billing": fixture_billing(),
+                    })
         self.assertEqual(extract.call_count, 1)
+
+    def test_preflight_rotates_to_next_bind_proxy_candidate(self):
+        checkout = {
+            "ok": True,
+            "checkout_id": "oaics_proxy_fixture",
+            "processor_entity": "openai_llc",
+            "_publishable_key": "pk_fixture",
+            "amount": "0",
+            "url": "https://chatgpt.com/checkout/openai_llc/oaics_proxy_fixture",
+        }
+        with (
+            patch("standalone_flow._extract_checkout", return_value=checkout),
+            patch("standalone_flow._remember_preflight"),
+            patch(
+                "standalone_flow.fetch_stripe_publishable_key",
+                side_effect=[
+                    RuntimeError("proxy connect failed"),
+                    RuntimeError("proxy TLS connect failed"),
+                    "pk_test_fixture",
+                ],
+            ) as fetch_key,
+        ):
+            result = preflight(
+                {
+                    "access_token": fixture_token(),
+                    "bind_proxy_pool": [
+                        "http://bind-one:8080",
+                        "http://bind-two:8080",
+                    ],
+                    "promo_proxy_pool": ["http://link-proxy:8081"],
+                }
+            )
+        self.assertEqual(result["publishable_key"], "pk_test_fixture")
+        self.assertEqual(fetch_key.call_count, 3)
+        self.assertEqual(fetch_key.call_args_list[0].kwargs["proxy"], "http://bind-one:8080")
+        self.assertEqual(fetch_key.call_args_list[1].kwargs["proxy"], "https://bind-one:8080")
+        self.assertEqual(fetch_key.call_args_list[2].kwargs["proxy"], "http://bind-two:8080")
 
     def test_speed_optimizations_are_enabled(self):
         frontend = (ROOT / "static" / "direct-bind.js").read_text(encoding="utf-8-sig")
         flow = (ROOT / "standalone_flow.py").read_text(encoding="utf-8-sig")
         extractor = (ROOT / "standalone_core" / "ph_shortlink_extractor.py").read_text(encoding="utf-8-sig")
         payment = (ROOT / "standalone_core" / "card_payment.py").read_text(encoding="utf-8-sig")
+        config_path = ROOT / "standalone_config.json"
+        if not config_path.exists():
+            config_path = ROOT / "standalone_config.example.json"
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
         self.assertIn("ACCOUNT_SAVE_DEBOUNCE_MS", frontend)
         self.assertIn("allocateFingerprints", frontend)
         self.assertIn("String(account.fingerprintRegion || '').toUpperCase() !== 'US'", frontend)
         self.assertIn("_take_preflight(ctx)", flow)
         self.assertIn("stage1_session if candidate == stage1_proxy", extractor)
         self.assertIn("if not config.fast_verify", payment)
+        self.assertIn('config.get("fast_verify", False)', flow)
+        self.assertFalse(config["fast_verify"])
+        self.assertIn("allow_redisplay: 'always'", frontend)
 
     def test_multiple_proxy_rows_are_parsed_and_round_robin_assigned(self):
         page = (ROOT / "index.html").read_text(encoding="utf-8-sig")
@@ -180,8 +231,10 @@ class StandaloneTests(unittest.TestCase):
         self.assertIn("account.bindProxyPool", frontend)
         self.assertIn("account.promoProxyPool", frontend)
         self.assertIn("bind[accountIndex % bind.length]", frontend)
-        self.assertIn("bind_proxy_pool: [previewBind]", frontend)
-        self.assertIn("promo_proxy_pool: [previewPromo]", frontend)
+        self.assertIn("const previewBindPool = data.bind", frontend)
+        self.assertIn("const previewPromoPool = data.promo", frontend)
+        self.assertIn("bind_proxy_pool: previewBindPool", frontend)
+        self.assertIn("promo_proxy_pool: previewPromoPool", frontend)
         self.assertIn("HTTP、HTTPS、SOCKS4、SOCKS4A、SOCKS5、SOCKS5H", page)
         self.assertIn("<small>优惠地区节点</small>", page)
 
@@ -366,12 +419,16 @@ class StandaloneTests(unittest.TestCase):
                 "bind_proxy_pool": ["127.0.0.1:8080"],
                 "promo_proxy_pool": ["127.0.0.2:8080"],
                 "billing": fixture_billing(),
+                "sentinel_token": "sentinel_fixture",
+                "telemetry": "telemetry_fixture",
             }
         )
         self.assertEqual(data["account_id"], "account_fixture")
         self.assertEqual(data["email"], "fixture@example.test")
         self.assertEqual(data["payment_method_id"], "pm_fixture")
         self.assertEqual(data["billing"]["country"], "US")
+        self.assertEqual(data["sentinel_token"], "sentinel_fixture")
+        self.assertEqual(data["telemetry"], "telemetry_fixture")
 
     def test_billing_address_is_explicit_and_validated(self):
         payload = {
@@ -529,10 +586,110 @@ class StandaloneTests(unittest.TestCase):
         self.assertEqual(card_payment.call_args_list[0].kwargs["proxy"], "https://bind-proxy:8080")
         self.assertEqual(card_payment.call_args_list[1].kwargs["proxy"], "http://bind-proxy:8080")
 
+    def test_card_flow_does_not_replay_after_remote_mutation_started(self):
+        checkout = {
+            "ok": True,
+            "checkout_id": "oaics_fixture",
+            "processor_entity": "openai_llc",
+            "_publishable_key": "pk_fixture",
+            "url": "https://chatgpt.com/checkout/openai_llc/oaics_fixture",
+        }
+        ambiguous_failure = card_payment.CardPaymentError(
+            "post-mutation transport failure: proxy TLS reset",
+            proxy_retry_safe=False,
+        )
+        logs: list[str] = []
+        with (
+            patch("standalone_flow._attach_fingerprint"),
+            patch("standalone_flow._take_preflight", return_value=checkout),
+            patch(
+                "standalone_flow.run_card_payment",
+                side_effect=ambiguous_failure,
+            ) as payment,
+        ):
+            with self.assertRaises(card_payment.CardPaymentError) as raised:
+                run_flow(
+                    {
+                        "access_token": fixture_token(),
+                        "payment_method_id": "pm_fixture",
+                        "card_last4": "4242",
+                        "flow_mode": "bind_only",
+                        "bind_proxy_pool": [
+                            "https://bind-proxy:8080",
+                            "http://bind-proxy:8080",
+                        ],
+                        "promo_proxy_pool": ["http://link-proxy:8081"],
+                        "billing": fixture_billing(),
+                    },
+                    logger=logs.append,
+                )
+        self.assertIs(raised.exception, ambiguous_failure)
+        self.assertEqual(payment.call_count, 1)
+        self.assertTrue(any("避免重复扣款" in message for message in logs))
+
     def test_errors_are_translated_to_chinese(self):
         self.assertIn("代理 TLS 握手失败", _safe_error("curl: (35) TLS connect error"))
         self.assertIn("账号没有新增支付方式", _safe_error("HTTP 402 card_declined Your card was declined"))
         self.assertIn("缺少账号 ID", _safe_error("AT does not contain an account id"))
+        self.assertIn(
+            "订阅尚未提交：缺少当前 Checkout 会话生成的动态校验数据",
+            _safe_error(
+                "checkout confirm precondition: missing flow-bound "
+                "OpenAI-Sentinel-Token, OAI-Telemetry"
+            ),
+        )
+
+    def test_checkout_confirmation_waiting_state_is_rendered(self):
+        source = (ROOT / "static" / "direct-bind.js").read_text(encoding="utf-8-sig")
+        self.assertIn("task.status === 'action_required'", source)
+        self.assertIn("'action_required'].includes(item.status)", source)
+        self.assertIn("return '待提交'", source)
+        self.assertIn("订阅尚未提交", source)
+        self.assertIn("个尚未提交", source)
+        self.assertIn("function canonicalCheckoutLink", source)
+        self.assertIn("function restoredAccountStage", source)
+        self.assertIn("lastTaskId: taskId", source)
+        self.assertIn("订阅待确认：使用当前行的 Checkout 链接继续", source)
+        self.assertIn("旧任务未保存 Checkout 链接", source)
+        self.assertEqual(
+            _checkout_link(
+                {
+                    "checkout_id": "oaics_fixture",
+                    "processor_entity": "openai_llc",
+                }
+            ),
+            "https://chatgpt.com/checkout/openai_llc/oaics_fixture",
+        )
+
+    def test_action_required_task_rebuilds_and_persists_checkout_link(self):
+        task_id = "checkout-link-recovery-fixture"
+        TASKS.pop(task_id, None)
+        with patch(
+            "server.run_flow",
+            return_value={
+                "ok": False,
+                "action_required": "checkout_session_confirmation",
+                "checkout_id": "oaics_fixture",
+                "processor_entity": "openai_llc",
+                "checkout_link": "",
+            },
+        ):
+            _run_task(task_id, {})
+        task = TASKS.pop(task_id)
+        self.assertEqual(task["status"], "action_required")
+        self.assertEqual(
+            task["result"]["checkout_link"],
+            "https://chatgpt.com/checkout/openai_llc/oaics_fixture",
+        )
+        self.assertIn("使用当前行的 Checkout 链接继续", task["stage"])
+        self.assertIn(
+            "订阅请求已提交，账号风控返回 status=blocked",
+            _safe_error("checkout confirm: server returned blocked"),
+        )
+        self.assertIn(
+            "自动重试已关闭",
+            _safe_error("checkout confirm: server returned blocked"),
+        )
 
     def test_account_import_is_memory_only_and_list_driven(self):
         source = (ROOT / "static" / "direct-bind.js").read_text(encoding="utf-8-sig")
@@ -553,6 +710,8 @@ class StandaloneTests(unittest.TestCase):
         self.assertIn("fingerprintId", source)
         self.assertNotIn("account-step-list", source)
         self.assertIn("account-row__current-step", source)
+        css_source = (ROOT / "static" / "direct-bind.css").read_text(encoding="utf-8")
+        self.assertIn("overflow-wrap:anywhere", css_source)
         self.assertIn("task.steps", source)
         allocation = source.index("assignProxies(accounts, data.bind, data.promo, mode)")
         self.assertIn("const settled = await submitAlignedWave(prepared, mode);", source[allocation:])
@@ -562,10 +721,31 @@ class StandaloneTests(unittest.TestCase):
         self.assertIn('max="50"', page)
         self.assertIn("MAX_BATCH_CONCURRENCY = 50", source)
         self.assertIn("namedAccessTokens", source)
-        self.assertIn("decodeAccount(token).accountId", source)
+        self.assertIn("decoded.accountId || decoded.userId || decoded.email", source)
+        self.assertIn("userId: String(auth.user_id", source)
+        self.assertIn("accountImportStatus", page)
+        self.assertIn("/api/account/resolve", source)
+        self.assertIn("resolveAccountIds", source)
+        self.assertNotIn(".filter((token) => Boolean(decodeAccount(token).accountId))", source)
         self.assertIn("state.accounts.length !== items.length", source)
         self.assertIn("account.stage = '环境已就绪'", source)
         self.assertIn("replace(/^注册指纹已就绪$/, '环境已就绪')", source)
+
+    def test_account_id_is_selected_from_account_check_ordering(self):
+        payload = {
+            "accounts": {
+                "account_first": {
+                    "account": {"account_id": "account_first"},
+                    "can_access_with_session": True,
+                },
+                "default": {
+                    "account": {"account_id": "account_first"},
+                    "can_access_with_session": True,
+                },
+            },
+            "account_ordering": ["account_first"],
+        }
+        self.assertEqual(_select_account_id(payload), "account_first")
 
     def test_aligned_batch_barrier_releases_threads_together(self):
         called: list[float] = []
